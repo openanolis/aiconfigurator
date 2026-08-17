@@ -2492,6 +2492,10 @@ class PerfDatabase:
         """Thin wrapper — delegates to ``SystemSpec.get_p2p_bandwidth``."""
         return self.system_spec.get_p2p_bandwidth(num_gpus)
 
+    def _get_p2p_latency(self, num_gpus: int) -> float:
+        """Thin wrapper — delegates to ``SystemSpec.get_p2p_latency``."""
+        return self.system_spec.get_p2p_latency(num_gpus)
+
     def set_default_database_mode(self, mode: common.DatabaseMode) -> None:
         """
         Set the default database mode
@@ -3106,12 +3110,20 @@ class PerfDatabase:
 
     @functools.lru_cache(maxsize=32768)
     def query_p2p(
-        self, message_bytes: int, database_mode: common.DatabaseMode | None = None
+        self,
+        message_bytes: int,
+        database_mode: common.DatabaseMode | None = None,
+        num_gpus: int | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
-        """Query P2P latency. Delegates to ``P2P._query_p2p_table``."""
+        """Query P2P latency. Delegates to ``P2P._query_p2p_table``.
+
+        ``num_gpus`` selects the topology tier; ``None`` keeps the flat
+        ``inter_node_bw`` pricing. It participates in the ``lru_cache`` key,
+        so tiers never alias each other.
+        """
         from aiconfigurator_core.sdk.operations.communication import P2P
 
-        return P2P._query_p2p_table(self, message_bytes, database_mode)
+        return P2P._query_p2p_table(self, message_bytes, database_mode, num_gpus)
 
     @functools.lru_cache(maxsize=32768)
     def query_wideep_deepep_ll(

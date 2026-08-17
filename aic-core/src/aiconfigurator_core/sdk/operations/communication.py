@@ -554,19 +554,33 @@ class P2P(Operation):
         database: PerfDatabase,
         message_bytes: int,
         database_mode: common.DatabaseMode | None = None,
+        num_gpus: int | None = None,
     ):
-        """Query P2P latency analytically. Verbatim port of the legacy body."""
+        """Query P2P latency analytically.
+
+        ``num_gpus`` is the number of GPUs the link spans, used to pick the
+        topology tier (intra-node / intra-rack / inter-rack). Leaving it
+        ``None`` keeps the legacy flat ``inter_node_bw`` + ``p2p_latency``
+        pricing, which is what every pipeline-parallel caller wants: adjacent
+        PP ranks are one hop apart and their span is not the deployment size.
+        Cross-pool callers (AFD) pass the span so a topology that leaves the
+        scale-up domain is priced on the scale-out fabric instead.
+        """
+
+        node_spec = database.system_spec["node"]
+        if num_gpus is None:
+            bandwidth = node_spec["inter_node_bw"]
+            latency = node_spec["p2p_latency"]
+        else:
+            bandwidth = database._get_p2p_bandwidth(num_gpus)
+            latency = database._get_p2p_latency(num_gpus)
 
         def get_sol(message_bytes: int) -> tuple[float, float, float]:
-            # TODO, use intra_node_bw if num_gpus < num_gpus_per_node
-            sol_time = message_bytes / database.system_spec["node"]["inter_node_bw"] * 1000
+            sol_time = message_bytes / bandwidth * 1000
             return sol_time, 0, sol_time
 
         def get_empirical(message_bytes: int) -> float:
-            return (
-                message_bytes / database.system_spec["node"]["inter_node_bw"]
-                + database.system_spec["node"]["p2p_latency"]
-            ) * 1000
+            return (message_bytes / bandwidth + latency) * 1000
 
         if database_mode is None:
             database_mode = database._default_database_mode
