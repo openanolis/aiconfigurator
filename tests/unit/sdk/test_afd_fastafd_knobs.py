@@ -164,7 +164,9 @@ class TestFLatencyScaleScalesOnlyTheFSide:
         session._nextn = 0
         session._a_database = object()
         session._f_database = object()
-        session._sum_latency = lambda ops, **kw: (0.0, {}) if ops == "attn" else (0.0, {})
+        # Both pools contribute zero compute, so t_f is exactly the pre-scaled
+        # AG/RS term the caller passed in.
+        session._sum_latency = lambda ops, **kw: (0.0, {})
 
         _a, t_f, *_ = session._integrate_decode_phase(
             a_partition=SimpleNamespace(attn_ops="attn"),
@@ -184,6 +186,90 @@ class TestFLatencyScaleScalesOnlyTheFSide:
             f_scale=0.45,
         )
         assert t_f == pytest.approx(0.09), "pre-scaled AG/RS term must not be scaled again"
+
+
+class TestSingleMicrobatchCannotOverlap:
+    """``num_microbatches < 2`` must use the serial cadence.
+
+    Both overlapped models need at least two in-flight microbatches: K=3
+    declares N_min=3 and K=2 declares N_min=2. Only the optimistic branch ever
+    enforced a threshold, and its fallback landed on conservative -- so mb=1
+    was handed ``max(t_a + t_a2f, t_f + t_f2a)``, a cadence it cannot sustain,
+    silently under-reporting decode-step latency.
+
+    With one microbatch in flight layer i+1's A input *is* layer i's F output,
+    so the pools strictly alternate. There is no intra-layer slack either:
+    every A-side op sits before the dispatch or after the combine.
+    """
+
+    _T_A = 1.0
+    _T_F = 3.0  # asymmetric, so serial and conservative are far apart
+    _HALF_C = 0.25
+
+    def _tcycle(self, *, num_microbatches, pipeline_model, tolerance=0.1):
+        session = _session(
+            num_microbatches=num_microbatches,
+            pipeline_model=pipeline_model,
+            comm_hiding_tolerance=tolerance,
+        )
+        return session._pipeline_tcycle(self._T_A, self._T_F, self._HALF_C, self._HALF_C)
+
+    @property
+    def _serial(self):
+        return self._T_A + self._T_F + 2 * self._HALF_C
+
+    @property
+    def _conservative(self):
+        return max(self._T_A + self._HALF_C, self._T_F + self._HALF_C)
+
+    @pytest.mark.parametrize("pipeline_model", ["optimistic", "conservative", "serial"])
+    def test_mb1_is_serial_for_every_requested_model(self, pipeline_model):
+        """The rule overrides the requested model, not just optimistic."""
+        t_cycle, comm_hidden = self._tcycle(num_microbatches=1, pipeline_model=pipeline_model)
+        assert t_cycle == pytest.approx(self._serial)
+        assert comm_hidden is False
+
+    def test_mb1_no_longer_reports_the_conservative_cadence(self):
+        """Regression guard: the two cadences must stay distinguishable here."""
+        assert self._serial != pytest.approx(self._conservative)
+        t_cycle, _ = self._tcycle(num_microbatches=1, pipeline_model="optimistic")
+        assert t_cycle != pytest.approx(self._conservative)
+
+    def test_mb2_still_reaches_an_overlapped_cadence(self):
+        """mb=2 is unaffected -- only mb<2 changes."""
+        t_cycle, _ = self._tcycle(num_microbatches=2, pipeline_model="conservative")
+        assert t_cycle == pytest.approx(self._conservative)
+        assert t_cycle < self._serial
+
+    def test_zero_or_none_microbatches_are_normalized_then_serialized(self):
+        """``num_microbatches`` is floored at 1 before the check.
+
+        ``AFDConfig`` rejects values below 1, so this only exercises the
+        session's own ``or 1`` normalization -- but it must not let a falsy
+        value slip into an overlapped cadence.
+        """
+        session = _session(num_microbatches=2, pipeline_model="optimistic")
+        session._afd_config.num_microbatches = None
+        t_cycle, comm_hidden = session._pipeline_tcycle(self._T_A, self._T_F, self._HALF_C, self._HALF_C)
+        assert t_cycle == pytest.approx(self._serial)
+        assert comm_hidden is False
+
+    def test_mb1_serial_matches_an_explicit_serial_request(self):
+        implicit, _ = self._tcycle(num_microbatches=1, pipeline_model="optimistic")
+        explicit, _ = self._tcycle(num_microbatches=4, pipeline_model="serial")
+        assert implicit == pytest.approx(explicit)
+
+    def test_mb1_does_not_emit_the_fallback_warning(self, caplog):
+        """mb=1 never reaches the optimistic branch, so no warning fires.
+
+        The warning describes a demotion to conservative; at mb=1 that is not
+        what happens, so emitting it would be misleading.
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="aiconfigurator"):
+            self._tcycle(num_microbatches=1, pipeline_model="optimistic", tolerance=0.0)
+        assert not [r for r in caplog.records if "optimistic pipeline" in r.getMessage()]
 
 
 class TestCommHidingTolerancePipeline:
@@ -224,11 +310,15 @@ class TestCommHidingTolerancePipeline:
         """The waiver requires at least two in-flight microbatches.
 
         A single microbatch cannot overlap anything, so no tolerance should
-        let it claim the K=3 cadence.
+        let it claim the K=3 cadence -- and it cannot claim K=2 either, so it
+        lands on the serial cadence. An earlier revision of this test asserted
+        the conservative value, locking in the defect that
+        ``TestSingleMicrobatchCannotOverlap`` now guards against.
         """
         t_cycle, comm_hidden = self._tcycle(t_c_total=0.01, num_microbatches=1, tolerance=1.0)
         assert comm_hidden is False
-        assert t_cycle == pytest.approx(self._T_A + 0.005)
+        # serial: t_a + t_a2f + t_f + t_f2a
+        assert t_cycle == pytest.approx(self._T_A + self._T_F + 0.01)
 
     def test_mb3_is_unaffected_by_the_tolerance(self):
         """mb=3 already satisfies the strict bound at small t_c."""
