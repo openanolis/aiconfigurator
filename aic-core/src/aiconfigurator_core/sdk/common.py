@@ -1017,6 +1017,7 @@ ColumnsAFD = [
     "nextn",
     "combined_with_pd",
     "boundary_on_attn",
+    "dispatch_mode",
     # Static prefill pool paired with the AFD pool in combined-with-PD
     # default-mode sweeps; NaN for single-phase AFD-only estimates.
     "(p)workers",
