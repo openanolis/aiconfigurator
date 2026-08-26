@@ -558,6 +558,9 @@ DefaultHFModels = {
     "zai-org/GLM-5.2",
     "zai-org/GLM-5.2-FP8",
     "nvidia/GLM-5.2-NVFP4",
+    "zai-org/GLM-5.3",
+    "zai-org/GLM-5.3-FP8",
+    "nvidia/GLM-5.3-NVFP4",
     # DeepSeek V4
     *DEEPSEEK_V4_HF_MODELS,
     # Qwen 3 Models
@@ -753,6 +756,15 @@ MULTIMODAL_TEXT_CONFIG_KEY = {
 # nextn="auto" cannot enable speculation and the MTP mismatch warning does
 # not apply (see Task._resolve_model_identity).
 DSPARK_ARCHITECTURES = frozenset({"KimiK3ForConditionalGeneration"})
+
+# Block size (draft tokens proposed per step) for each DSPARK architecture.
+# This is a fixed constant of the draft model's design — not user-configurable
+# and not present in the main checkpoint (the draft is a separate artifact).
+# Maps architecture name → nextn block size passed to the backend as
+# speculative_config.num_speculative_tokens.
+DSPARK_NEXTN: dict[str, int] = {
+    "KimiK3ForConditionalGeneration": 7,
+}
 
 """
 All reduce strategy for trtllm custom allreduce
