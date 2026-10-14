@@ -1077,6 +1077,7 @@ def cli_estimate(
     afd_phase: str = "decode",
     afd_combined_with_pd: bool = True,
     afd_boundary_on_attn: bool = True,
+    afd_dispatch_mode: str = "f_side_routing",
 ) -> EstimateResult:
     """
     Estimate TTFT, TPOT, and power for a single model/system/config combination.
@@ -1205,6 +1206,10 @@ def cli_estimate(
             ``logits_gemm``) to the A-Worker when True (default); set False to
             place them on the F-Worker. Inverse of the CLI ``--boundary-on-ffn``
             flag.
+        afd_dispatch_mode: (afd-only) Cross-pool dispatch topology:
+            ``'f_side_routing'`` (default, routing on the F side) or
+            ``'a_side_routing'`` (DeepEP low-latency style direct dispatch;
+            MoE only). See ``operations.afd_transfer`` for the byte models.
 
     Returns:
         EstimateResult with ttft, tpot, power_w, mode, and the full raw result dict.
@@ -1486,6 +1491,7 @@ def cli_estimate(
             afd_phase=afd_phase,
             afd_combined_with_pd=afd_combined_with_pd,
             afd_boundary_on_attn=afd_boundary_on_attn,
+            afd_dispatch_mode=afd_dispatch_mode,
             gemm_quant_mode=gemm_quant_mode,
             kvcache_quant_mode=kvcache_quant_mode,
             fmha_quant_mode=fmha_quant_mode,
@@ -2231,6 +2237,7 @@ def _run_afd_estimate(
     afd_phase,
     afd_combined_with_pd,
     afd_boundary_on_attn,
+    afd_dispatch_mode,
     gemm_quant_mode,
     kvcache_quant_mode,
     fmha_quant_mode,
@@ -2343,6 +2350,7 @@ def _run_afd_estimate(
         phase=afd_phase,
         combined_with_pd=bool(afd_combined_with_pd),
         boundary_on_attn=bool(afd_boundary_on_attn),
+        dispatch_mode=afd_dispatch_mode,
     )
     runtime_config = RuntimeConfig(
         isl=isl,
