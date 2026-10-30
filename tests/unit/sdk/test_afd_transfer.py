@@ -30,6 +30,7 @@ from aiconfigurator.sdk.operations import (
     AFDFReduceScatter,
     AFDTransfer,
     _afd_send_prob,
+    afd_dest_ep_ranks,
 )
 from aiconfigurator.sdk.performance_result import PerformanceResult
 from aiconfigurator_core.sdk.operations import afd_transfer as afd_transfer_module
@@ -153,23 +154,32 @@ class TestAFDTransfer:
         with pytest.raises(ValueError, match="direction"):
             self._make(direction="both")
 
-    def test_dense_per_link_bytes(self, engine):
+    def test_dense_aggregate_egress_bytes(self, engine):
         op = self._make(n_a_workers=4, n_f_workers=16, gpus_per_node=8, hidden_size=1024)
         op.query(_DB, x=32)
         nf = 2  # 16 / 8
         p_send = _afd_send_prob(0, 0, nf)  # 1/nf = 0.5
-        # per-link = single A-rank's tokens * p_send * hidden * bpe
-        expected_bytes = int(p_send * 32 * 1024 * 2)
+        # Aggregate egress of one A-rank: nf destinations sharing one NIC.
+        # Dense: nf * (1/nf) = 1, i.e. the whole batch leaves the NIC once.
+        expected_bytes = int(nf * p_send * 32 * 1024 * 2)
         assert engine.p2p_calls[0] == _half_ceil(expected_bytes)
+        assert expected_bytes == 32 * 1024 * 2
 
-    def test_moe_selective_per_link_bytes(self, engine):
+    def test_moe_selective_aggregate_egress_bytes(self, engine):
         op = self._make(num_experts=256, topk=8)
         op.query(_DB, x=32)
         nf = 2
         p_send = _afd_send_prob(256, 8, nf)
-        # per-link = single A-rank's 32 tokens
-        expected_bytes = int(p_send * 32 * 1024 * 2)
+        # Aggregate over both destination nodes; each gets the deduped subset.
+        expected_bytes = int(nf * p_send * 32 * 1024 * 2)
         assert engine.p2p_calls[0] == _half_ceil(expected_bytes)
+
+    def test_wide_a_pool_is_billed_at_the_f_side_ingress(self, engine):
+        # 64 A ranks feeding 16 F GPUs: each F GPU handles 4x what one A rank
+        # sends, so the F side sets the pace.
+        self._make(n_a_workers=64, n_f_workers=16, gpus_per_node=8).query(_DB, x=32)
+        self._make(n_a_workers=4, n_f_workers=16, gpus_per_node=8).query(_DB, x=32)
+        assert engine.p2p_calls[0] == 4 * engine.p2p_calls[1]
 
     def test_num_f_nodes_property(self):
         op = self._make(n_f_workers=20, gpus_per_node=8)
@@ -182,6 +192,68 @@ class TestAFDTransfer:
         r_decode = op.query(_DB, x=32)
         r_prefill = op.query(_DB, x=32 * 4096)
         assert float(r_prefill) == pytest.approx(float(r_decode) * 4096, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_mode="a_side_routing" (DeepEP low-latency style direct dispatch)
+# ---------------------------------------------------------------------------
+
+
+def test_afd_dest_ep_ranks_anchors():
+    assert afd_dest_ep_ranks(256, 8, 1) == pytest.approx(1.0)  # single rank: one destination
+    assert 1.0 < afd_dest_ep_ranks(256, 8, 16) <= min(8, 16)  # bounded by min(topk, ep)
+    assert afd_dest_ep_ranks(16, 4, 16) == pytest.approx(4.0)  # one expert/rank: exactly topk
+
+
+class TestAFDTransferASideRouting:
+    """A-side routing bills one A-rank's *aggregate* egress across all
+    destination EP ranks; ``f_side_routing`` aggregates over the F nodes."""
+
+    def _make(self, direction="a2f", **overrides) -> AFDTransfer:
+        base = dict(
+            name="afd_transfer",
+            scale_factor=1.0,
+            direction=direction,
+            hidden_size=1024,
+            n_a_workers=4,
+            n_f_workers=32,
+            gpus_per_node=8,
+            num_experts=256,
+            topk=8,
+            comm_quant_mode=common.CommQuantMode.half,
+            dispatch_mode="a_side_routing",
+            f_moe_ep_size=16,
+        )
+        base.update(overrides)
+        return AFDTransfer(**base)
+
+    def test_a2f_bytes_include_fanout_and_tp_replication(self, engine):
+        op = self._make(direction="a2f")
+        op.query(_DB, x=32)
+        n_dest = afd_dest_ep_ranks(256, 8, 16)
+        moe_tp = 32 // 16
+        assert engine.p2p_calls[0] == _half_ceil(int(n_dest * moe_tp * 32 * 1024 * 2))
+
+    def test_f2a_returns_one_partial_per_ep_rank(self, engine):
+        op = self._make(direction="f2a")
+        op.query(_DB, x=32)
+        n_dest = afd_dest_ep_ranks(256, 8, 16)
+        assert engine.p2p_calls[0] == _half_ceil(int(n_dest * 32 * 1024 * 2))
+
+    def test_invalid_dispatch_mode_raises(self):
+        with pytest.raises(ValueError, match="dispatch_mode"):
+            self._make(dispatch_mode="a_side")
+
+    def test_dense_model_rejected(self):
+        with pytest.raises(ValueError, match="requires a MoE model"):
+            self._make(num_experts=0, topk=0)
+
+    def test_f_side_routing_unchanged_by_new_kwargs(self, engine):
+        """Passing the new knobs must not perturb the default topology."""
+        self._make(direction="a2f", dispatch_mode="f_side_routing", f_moe_ep_size=16).query(_DB, x=32)
+        nf = 4  # 32 F-GPUs / 8 per node
+        p_send = _afd_send_prob(256, 8, nf)
+        assert engine.p2p_calls[0] == _half_ceil(int(nf * p_send * 32 * 1024 * 2))
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +273,6 @@ class TestAFDFAllGather:
             num_experts=0,
             topk=0,
             comm_quant_mode=common.CommQuantMode.half,
-            rank_mapping="one_to_one",
         )
         base.update(overrides)
         return AFDFAllGather(**base)
@@ -217,10 +288,12 @@ class TestAFDFAllGather:
         assert float(result) == 0.0
         assert engine.nccl_calls == []
 
-    def test_broadcast_mapping_returns_zero(self, engine):
-        op = self._make(rank_mapping="broadcast")
-        result = op.query(_DB, x=32)
-        assert float(result) == 0.0
+    def test_a_side_routing_returns_zero(self, engine):
+        # A-side routing sends tokens straight to their experts' GPUs, so
+        # there is nothing left to redistribute inside the F node.
+        op = self._make(dispatch_mode="a_side_routing", num_experts=256, topk=8)
+        assert float(op.query(_DB, x=32)) == 0.0
+        assert engine.nccl_calls == []
 
     def test_one_to_one_queries_nccl_allgather(self, engine):
         op = self._make(n_f_workers=16, gpus_per_node=8)
@@ -253,9 +326,9 @@ class TestAFDFAllGather:
         expected_msg = int(p_send * total * 1024 / f_local)
         assert engine.nccl_calls[0][3] == expected_msg
 
-    def test_invalid_rank_mapping_raises(self):
-        with pytest.raises(ValueError, match="rank_mapping"):
-            self._make(rank_mapping="ring")
+    def test_invalid_dispatch_mode_raises(self):
+        with pytest.raises(ValueError, match="dispatch_mode"):
+            self._make(dispatch_mode="ring")
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +348,6 @@ class TestAFDFReduceScatter:
             num_experts=0,
             topk=0,
             comm_quant_mode=common.CommQuantMode.half,
-            rank_mapping="one_to_one",
         )
         base.update(overrides)
         return AFDFReduceScatter(**base)
@@ -289,6 +361,12 @@ class TestAFDFReduceScatter:
         op = self._make(n_f_workers=1, gpus_per_node=1)
         result = op.query(_DB, x=32)
         assert float(result) == 0.0
+
+    def test_a_side_routing_returns_zero(self, engine):
+        # Each F-GPU returns its own partials straight to the owning A-rank.
+        op = self._make(dispatch_mode="a_side_routing", num_experts=256, topk=8)
+        assert float(op.query(_DB, x=32)) == 0.0
+        assert engine.nccl_calls == []
 
     def test_ep8_tp1_still_needs_reduce_scatter(self, engine):
         op = self._make(n_f_workers=8, gpus_per_node=8)
@@ -304,9 +382,9 @@ class TestAFDFReduceScatter:
         assert engine.nccl_calls[0][2] == "reduce_scatter"
         assert engine.nccl_calls[0][1] == 8  # min(16, 8) = 8 GPUs in node
 
-    def test_invalid_rank_mapping_raises(self):
-        with pytest.raises(ValueError, match="rank_mapping"):
-            self._make(rank_mapping="bogus")
+    def test_invalid_dispatch_mode_raises(self):
+        with pytest.raises(ValueError, match="dispatch_mode"):
+            self._make(dispatch_mode="bogus")
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +435,16 @@ class TestAFDCombine:
         r_prefill = op.query(_DB, x=32 * 4096)
         assert float(r_prefill) == pytest.approx(float(r_decode) * 4096, rel=1e-3)
 
+    def test_a_side_routing_reduces_only_reached_ep_ranks(self, engine):
+        # Only the EP ranks holding one of the token's top-k experts send a
+        # partial back, so the reduce is over the expected fan-out, not over
+        # every EP rank.
+        op = self._make(f_moe_ep_size=16, dispatch_mode="a_side_routing", num_experts=256, topk=8)
+        op.query(_DB, x=32)
+        n_dest = afd_dest_ep_ranks(256, 8, 16)
+        assert engine.mem_calls[0] == _half_ceil(int((n_dest + 1) * 32 * 1024 * 2))
+        assert engine.mem_calls[0] < _half_ceil((16 + 1) * 32 * 1024 * 2)  # cheaper than f_side_routing
+
 
 # ---------------------------------------------------------------------------
 # Numerical equivalence with old monolithic AFDTransfer behavior
@@ -400,7 +488,6 @@ class TestNumericalEquivalence:
             num_experts=num_experts,
             topk=topk,
             comm_quant_mode=qm,
-            rank_mapping="one_to_one",
         )
         rs = AFDFReduceScatter(
             name="afd_f_reduce_scatter",
@@ -412,7 +499,6 @@ class TestNumericalEquivalence:
             num_experts=num_experts,
             topk=topk,
             comm_quant_mode=qm,
-            rank_mapping="one_to_one",
         )
         combine = AFDCombine(
             name="afd_combine",
